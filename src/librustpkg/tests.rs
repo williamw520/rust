@@ -34,7 +34,6 @@ use rustc::driver::driver::{build_session, build_session_options, host_triple, o
 use syntax::diagnostic;
 use target::*;
 use package_source::PkgSrc;
-use util::datestamp;
 
 fn fake_ctxt(sysroot: Path, workspace: &Path) -> BuildContext {
     let context = workcache::Context::new(
@@ -473,7 +472,8 @@ fn touch_source_file(workspace: &Path, pkgid: &PkgId) {
     for p in contents.iter() {
         if p.filetype() == Some(".rs") {
             // should be able to do this w/o a process
-            if run::process_output("touch", [p.to_str()]).status != 0 {
+            // n.b. Bumps time up by 2 seconds to get around granularity issues
+            if run::process_output("touch", [~"-A", ~"02", p.to_str()]).status != 0 {
                 let _ = cond.raise((pkg_src_dir.clone(), ~"Bad path"));
             }
         }
@@ -960,12 +960,17 @@ fn no_rebuilding() {
     let p_id = PkgId::new("foo");
     let workspace = create_local_package(&p_id);
     command_line_test([~"build", ~"foo"], &workspace);
-    let date = datestamp(&built_library_in_workspace(&p_id,
-                                                    &workspace).expect("no_rebuilding"));
+    let foo_lib = lib_output_file_name(&workspace, "foo");
+    // Now make `foo` read-only so that subsequent rebuilds of it will fail
+    assert!(chmod_read_only(&foo_lib));
+
     command_line_test([~"build", ~"foo"], &workspace);
-    let newdate = datestamp(&built_library_in_workspace(&p_id,
-                                                       &workspace).expect("no_rebuilding (2)"));
-    assert_eq!(date, newdate);
+
+    match command_line_test_partial([~"build", ~"foo"], &workspace) {
+        Success(*) => (), // ok
+        Fail(status) if status == 65 => fail2!("no_rebuilding failed: it tried to rebuild bar"),
+        Fail(_) => fail2!("no_rebuilding failed for some other reason")
+    }
 }
 
 #[test]
@@ -975,54 +980,53 @@ fn no_rebuilding_dep() {
     let workspace = create_local_package_with_dep(&p_id, &dep_id);
     command_line_test([~"build", ~"foo"], &workspace);
     let bar_lib = lib_output_file_name(&workspace, "bar");
-    let bar_date_1 = datestamp(&bar_lib);
-
     frob_source_file(&workspace, &p_id, "main.rs");
-
     // Now make `bar` read-only so that subsequent rebuilds of it will fail
     assert!(chmod_read_only(&bar_lib));
-
     match command_line_test_partial([~"build", ~"foo"], &workspace) {
         Success(*) => (), // ok
         Fail(status) if status == 65 => fail2!("no_rebuilding_dep failed: it tried to rebuild bar"),
         Fail(_) => fail2!("no_rebuilding_dep failed for some other reason")
     }
-
-    let bar_date_2 = datestamp(&lib_output_file_name(&workspace,
-                                                   "bar"));
-    assert_eq!(bar_date_1, bar_date_2);
 }
 
 #[test]
-#[ignore]
 fn do_rebuild_dep_dates_change() {
     let p_id = PkgId::new("foo");
     let dep_id = PkgId::new("bar");
     let workspace = create_local_package_with_dep(&p_id, &dep_id);
     command_line_test([~"build", ~"foo"], &workspace);
     let bar_lib_name = lib_output_file_name(&workspace, "bar");
-    let bar_date = datestamp(&bar_lib_name);
-    debug2!("Datestamp on {} is {:?}", bar_lib_name.to_str(), bar_date);
     touch_source_file(&workspace, &dep_id);
-    command_line_test([~"build", ~"foo"], &workspace);
-    let new_bar_date = datestamp(&bar_lib_name);
-    debug2!("Datestamp on {} is {:?}", bar_lib_name.to_str(), new_bar_date);
-    assert!(new_bar_date > bar_date);
+
+    // Now make `bar` read-only so that subsequent rebuilds of it will fail
+    assert!(chmod_read_only(&bar_lib_name));
+
+    match command_line_test_partial([~"build", ~"foo"], &workspace) {
+        Success(*) => fail2!("do_rebuild_dep_dates_change failed: it didn't rebuild bar"),
+        Fail(status) if status == 65 => (), // ok
+        Fail(_) => fail2!("do_rebuild_dep_dates_change failed for some other reason")
+    }
 }
 
 #[test]
-#[ignore]
 fn do_rebuild_dep_only_contents_change() {
     let p_id = PkgId::new("foo");
     let dep_id = PkgId::new("bar");
     let workspace = create_local_package_with_dep(&p_id, &dep_id);
     command_line_test([~"build", ~"foo"], &workspace);
-    let bar_date = datestamp(&lib_output_file_name(&workspace, "bar"));
     frob_source_file(&workspace, &dep_id, "lib.rs");
+    let bar_lib_name = lib_output_file_name(&workspace, "bar");
+
+    // Now make `bar` read-only so that subsequent rebuilds of it will fail
+    assert!(chmod_read_only(&bar_lib_name));
+
     // should adjust the datestamp
-    command_line_test([~"build", ~"foo"], &workspace);
-    let new_bar_date = datestamp(&lib_output_file_name(&workspace, "bar"));
-    assert!(new_bar_date > bar_date);
+    match command_line_test_partial([~"build", ~"foo"], &workspace) {
+        Success(*) => fail2!("do_rebuild_dep_only_contents_change failed: it didn't rebuild bar"),
+        Fail(status) if status == 65 => (), // ok
+        Fail(_) => fail2!("do_rebuild_dep_only_contents_change failed for some other reason")
+    }
 }
 
 #[test]
@@ -1823,7 +1827,6 @@ fn test_rustpkg_test_output() {
 }
 
 #[test]
-#[ignore(reason = "See issue #9441")]
 fn test_rebuild_when_needed() {
     let foo_id = PkgId::new("foo");
     let foo_workspace = create_local_package(&foo_id);
